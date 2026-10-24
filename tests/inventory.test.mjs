@@ -12,12 +12,11 @@ function fixture(){
   const sql={exec(query,...args){const s=db.prepare(query);if(/^SELECT/i.test(query))return s.all(...args);s.run(...args);return [];}};
   const txn=fn=>{db.exec('BEGIN IMMEDIATE');try{const r=fn();db.exec('COMMIT');return r;}catch(e){db.exec('ROLLBACK');throw e;}};
   const inv=new Inventory(sql,txn);
-  inv.saveManagers({managers:[{id:'manager-1',name:'Test manager',username:'test_manager'}]});
   const shipment={id:'sample',title:'Поставка',brand:'Test',status:'in_transit',eta:'2026-10-01',products:[{id:'p1',sku:'1',name:'Кабель',stock:10,price:16000},{id:'p2',sku:'2',name:'Чехол',stock:2,price:50000}]};
   inv.importShipment(shipment);
   return {inv,shipment,sql,txn};
 }
-const request=(key,qty=3)=>({shipmentId:'sample',requestKey:key,managerId:'manager-1',lines:[{id:'p1',quantity:qty}]});
+const request=(key,qty=3)=>({shipmentId:'sample',requestKey:key,lines:[{id:'p1',quantity:qty}]});
 test('reservation uses server price, deducts stock, creates notification in same transaction',()=>{
   const {inv}=fixture();const r=inv.reserve(user,{...request('key'),total:1,lines:[{id:'p1',quantity:3,price:1}]});
   assert.equal(r.total,48000);assert.equal(inv.catalog()[0].products[0].stock,7);assert.equal(inv.rows('SELECT * FROM outbox').length,1);
@@ -43,7 +42,7 @@ test('cancellation restores stock exactly once; other clients cannot cancel or r
 });
 test('confirmation does not deduct twice; only admin can cancel confirmed reserve',()=>{
   const {inv}=fixture();const r=inv.reserve(user,request('key'));assert.throws(()=>inv.changeReservation(user,r.id,'confirmed'),/прав/);
-  inv.changeReservation(user,r.id,'confirmed',true);assert.equal(inv.catalog()[0].products[0].stock,7);assert.throws(()=>inv.changeReservation(user,r.id,'cancelled'),/менеджером/);inv.changeReservation(user,r.id,'cancelled',true);assert.equal(inv.catalog()[0].products[0].stock,10);
+  inv.changeReservation(user,r.id,'confirmed',true);assert.equal(inv.catalog()[0].products[0].stock,7);assert.throws(()=>inv.changeReservation(user,r.id,'cancelled'),/администратором/);inv.changeReservation(user,r.id,'cancelled',true);assert.equal(inv.catalog()[0].products[0].stock,10);
 });
 test('updating shipment retains reservations and rejects totals below reserved',()=>{
   const {inv,shipment}=fixture();inv.reserve(user,request('key',7));shipment.products[0].stock=20;inv.importShipment(shipment);assert.equal(inv.catalog()[0].products[0].stock,13);
@@ -120,54 +119,38 @@ test('bot setup reports Telegram failures without exposing token or secret',asyn
   assert(!body.includes(token));assert(!body.includes(store.webhookSecret()));
 });
 
-test('manager is required, validated on server, and included in notification',()=>{
-  const {inv}=fixture();
-  for(const managerId of [undefined,'missing'])assert.throws(()=>inv.reserve(user,{...request('bad'),managerId}),/менеджера/);
-  assert.equal(inv.catalog()[0].products[0].stock,10);assert.equal(inv.rows('SELECT * FROM outbox').length,0);
-  const r=inv.reserve(user,{...request('good'),manager:{name:'Forged',username:'wrong_person'}});
-  assert.deepEqual(r.manager,{id:'manager-1',name:'Test manager',username:'test_manager'});
-  assert.match(JSON.parse(inv.rows('SELECT data FROM outbox')[0].data).text,/Менеджер: Test manager @test_manager/);
+test('reservations work without managers or manager notifications',()=>{
+  const {inv}=fixture();const r=inv.reserve(user,request('new'));
+  assert.equal(r.manager,undefined);
+  assert.equal(inv.catalog()[0].products[0].stock,7);
+  assert.doesNotMatch(inv.notificationText(r),/Менеджер:/);
+  assert.equal(inv.rows("SELECT name FROM sqlite_master WHERE type='table' AND name='managers'").length,0);
 });
 
-test('manager snapshot survives edits/removal; retry cannot change assignment',()=>{
-  const {inv}=fixture();const r=inv.reserve(user,request('original'));
-  inv.saveManagers({managers:[{id:'manager-2',name:'Other manager',username:'other_manager'}]});
-  assert.equal(inv.reserve(user,request('original')).id,r.id);
-  assert.throws(()=>inv.reserve(user,{...request('original'),managerId:'manager-2'}),/другим содержимым/);
-  assert.throws(()=>inv.reserve(user,request('new')),/менеджера/);
-  const cancelled=inv.changeReservation(user,r.id,'cancelled');assert.equal(cancelled.manager.username,'test_manager');
-  const messages=inv.rows('SELECT data FROM outbox').map(x=>JSON.parse(x.data).text);
-  assert(messages.every(text=>text.includes('@test_manager')));assert.equal(inv.catalog()[0].products[0].stock,10);
-});
-
-test('manager list rejects duplicate usernames and invalid handles without losing existing list',()=>{
-  const {inv}=fixture();
-  for(const managers of [
-    [{id:'a',name:'A',username:'@same_user'},{id:'b',name:'B',username:'SAME_USER'}],
-    [{id:'a',name:'A',username:'https://t.me/person'}],
-    [{id:'a',name:'A',username:'one_user\n@other_user'}]
-  ])assert.throws(()=>inv.saveManagers({managers}));
-  assert.equal(inv.managers()[0].id,'manager-1');
-});
-
-test('only admin can change managers; authenticated clients can read the choices',async()=>{
-  const {sql,txn}=fixture(),token='test:managers';
-  const store=new ReserveStore({storage:{sql,transactionSync:txn}},{BOT_TOKEN:token,ADMIN_IDS:'999'});
+test('retired manager endpoints reject requests',async()=>{
+  const {sql,txn}=fixture(),token='test:gone';
+  const store=new ReserveStore({storage:{sql,transactionSync:txn}},{BOT_TOKEN:token,ADMIN_IDS:'123'});
   const headers={'Content-Type':'application/json','X-Telegram-Init-Data':signedData(token)};
-  assert.equal((await store.fetch(new Request('https://app/api/managers'))).status,401);
-  assert.equal((await store.fetch(new Request('https://app/api/managers',{headers}))).status,200);
-  assert.equal((await store.fetch(new Request('https://app/api/admin/managers',{method:'PUT',headers,body:'{"managers":[]}'}))).status,403);
-  assert.equal(store.inventory.managers().length,1);
+  for(const [url,method] of [['https://app/api/managers','GET'],['https://app/api/admin/managers','PUT']]){
+    const options={method,headers,...(method==='PUT'?{body:'{}'}:{})};
+    assert.equal((await store.fetch(new Request(url,options))).status,404);
+  }
 });
 
-test('legacy reservations remain readable, cancellable, and retryable without a manager',()=>{
-  const {inv}=fixture();const input=request('legacy'),r=inv.reserve(user,input);
-  delete r.manager;
-  inv.sql.exec('UPDATE reservations SET data=?,fingerprint=? WHERE id=?',JSON.stringify(r),JSON.stringify({shipment:input.shipmentId,lines:input.lines,comment:''}),r.id);
-  const {managerId,...legacyInput}=input;
-  assert.equal(inv.reserve(user,legacyInput).id,r.id);
+test('historic reservation keeps idempotency without manager selection',()=>{
+  const {inv}=fixture();const input=request('old'),r=inv.reserve(user,input);
+  const saved=inv.one('SELECT data,fingerprint FROM reservations WHERE id=?',r.id);
+  const fingerprint=JSON.stringify({...JSON.parse(saved.fingerprint),managerId:'old-agent'});
+  const previous={...JSON.parse(saved.data),manager:{id:'old-agent',name:'Old agent',username:'legacy'}};
+  inv.sql.exec('UPDATE reservations SET data=?,fingerprint=? WHERE id=?',JSON.stringify(previous),fingerprint,r.id);
+  const retry=inv.reserve(user,input);
+  assert.equal(retry.id,r.id);assert.equal(retry.manager,undefined);
   assert.equal(inv.reservations(user)[0].manager,undefined);
-  inv.changeReservation(user,r.id,'cancelled');assert.equal(inv.catalog()[0].products[0].stock,10);
+  assert.throws(()=>inv.reserve(user,request('old',5)),/другим содержимым/);
+  const cancelled=inv.changeReservation(user,r.id,'cancelled');
+  assert.equal(cancelled.manager,undefined);
+  assert.equal(inv.catalog()[0].products[0].stock,10);
+  assert(inv.rows('SELECT data FROM outbox').every(row=>!JSON.parse(row.data).text.includes('Менеджер:')));
 });
 
 const editInput=(r,lines,extra={})=>({requestKey:crypto.randomUUID(),expectedRevision:r.revision||1,lines,comment:r.comment,...extra});
@@ -177,7 +160,7 @@ test('editing adjusts only stock differences, preserves agreed prices, and cance
   shipment.products[0].price=99000;inv.importShipment(shipment);
   const edit=editInput(r,[{id:'p1',quantity:4},{id:'p2',quantity:1}],{comment:'Updated'});
   const changed=inv.editReservation(user,r.id,edit);
-  assert.equal(changed.total,4*16000+50000);assert.equal(changed.revision,2);assert.equal(changed.manager.username,'test_manager');
+  assert.equal(changed.total,4*16000+50000);assert.equal(changed.revision,2);assert.equal(changed.manager,undefined);
   assert.deepEqual(inv.catalog()[0].products.map(p=>p.stock),[1,1]);
   assert.equal(inv.editReservation(user,r.id,edit).repeated,true);assert.deepEqual(inv.catalog()[0].products.map(p=>p.stock),[1,1]);
   const shrunk=inv.editReservation(user,r.id,editInput(changed,[{id:'p2',quantity:2}]));
@@ -232,7 +215,7 @@ test('Telegram send IDs persist across restarts; edit, confirm and cancel update
   restarted.inventory.changeReservation(user,r.id,'cancelled',true);await restarted.flush();
   assert.deepEqual(calls.map(c=>c.method),['sendMessage','editMessageText','editMessageText','editMessageText']);
   assert(calls.slice(1).every(c=>c.body.message_id===77));
-  assert.match(calls[1].body.text,/Резерв изменён/);assert.match(calls[1].body.text,/4 шт/);assert.match(calls[1].body.text,/@test_manager/);
+  assert.match(calls[1].body.text,/Резерв изменён/);assert.match(calls[1].body.text,/4 шт/);assert.doesNotMatch(calls[1].body.text,/Менеджер:/);
   assert.match(calls[3].body.text,/Резерв отменён/);assert.equal(changed.revision,2);
 });
 test('queued updates send latest state once; transient edit errors retry without a new message',async t=>{
